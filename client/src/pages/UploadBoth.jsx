@@ -45,8 +45,15 @@ export default function UploadBoth() {
           </svg>
           Back
         </button>
-        <span className="text-xs font-bold uppercase tracking-[0.15em] px-3 py-1.5 rounded-full"
-          style={{ backgroundColor: "rgba(168,85,247,0.1)", color: "#a78bfa", border: "1px solid rgba(168,85,247,0.2)" }}
+        <span
+          className="inline-flex items-center text-xs font-bold uppercase tracking-[0.1em] rounded-full"
+          style={{
+            backgroundColor: "rgba(168,85,247,0.1)",
+            color: "#a78bfa",
+            border: "1px solid rgba(168,85,247,0.2)",
+            padding: "0.5rem 1rem",
+            lineHeight: "1.2",
+          }}
         >
           Mode 2 — RFP + Proposal
         </span>
@@ -64,20 +71,34 @@ export default function UploadBoth() {
             </p>
           </div>
 
-          <div className="glass-card p-8 flex flex-col gap-6">
+          <div className="glass-card flex flex-col mt-6" style={{ padding: "1rem 1.25rem 1.25rem" }}>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
-              <FileDropZone
-                file={rfpFile}
-                onFile={setRfpFile}
-                onRemove={() => setRfpFile(null)}
-                label="RFP Document"
-              />
-              <FileDropZone
-                file={vendorFile}
-                onFile={setVendorFile}
-                onRemove={() => setVendorFile(null)}
-                label="Vendor Proposal"
-              />
+              <div>
+                <p
+                  className="text-xs font-semibold uppercase tracking-[0.15em]"
+                  style={{ color: "#6b7280", padding: "0.5rem 0" }}
+                >
+                  RFP Document
+                </p>
+                <FileDropZone
+                  file={rfpFile}
+                  onFile={setRfpFile}
+                  onRemove={() => setRfpFile(null)}
+                />
+              </div>
+              <div>
+                <p
+                  className="text-xs font-semibold uppercase tracking-[0.15em]"
+                  style={{ color: "#6b7280", padding: "0.5rem 0" }}
+                >
+                  Vendor Proposal
+                </p>
+                <FileDropZone
+                  file={vendorFile}
+                  onFile={setVendorFile}
+                  onRemove={() => setVendorFile(null)}
+                />
+              </div>
             </div>
 
             {useComplianceStore.getState().error && (
@@ -89,8 +110,10 @@ export default function UploadBoth() {
             <button
               onClick={handleValidate}
               disabled={!canStart || loading}
-              className="w-full py-3 rounded-xl font-semibold text-sm tracking-wide transition-all duration-200"
+              className="w-full rounded-xl font-semibold text-sm tracking-wide transition-all duration-200"
               style={{
+                marginTop: "0.75rem",
+                padding: "0.85rem 1.5rem",
                 background: !canStart || loading
                   ? "rgba(17, 17, 24, 0.8)"
                   : "linear-gradient(135deg, #8b5cf6, #a855f7)",

@@ -42,12 +42,19 @@ export default function UploadRFP() {
           </svg>
           Back
         </button>
-        <span className="text-xs font-bold uppercase tracking-[0.15em] px-3 py-1.5 rounded-full"
-          style={{ backgroundColor: "rgba(99,102,241,0.1)", color: "#818cf8", border: "1px solid rgba(99,102,241,0.2)" }}
+        <span
+          className="inline-flex items-center text-xs font-bold uppercase tracking-[0.1em] rounded-full"
+          style={{
+            backgroundColor: "rgba(99,102,241,0.1)",
+            color: "#818cf8",
+            border: "1px solid rgba(99,102,241,0.2)",
+            padding: "0.5rem 1rem",
+            lineHeight: "1.2",
+          }}
         >
           Mode 1 — RFP Only
         </span>
-      </nav>
+      </nav>  
 
       {/* Content */}
       <div className="flex-1 flex flex-col items-center justify-center px-4 py-16">
@@ -61,12 +68,17 @@ export default function UploadRFP() {
             </p>
           </div>
 
-          <div className="glass-card p-8 flex flex-col gap-6">
+          <div className="glass-card flex flex-col mt-6" style={{ padding: "1rem 1.25rem 1.25rem" }}>
+            <p
+              className="text-xs font-semibold uppercase tracking-[0.15em]"
+              style={{ color: "#6b7280", padding: "0.5rem 0" }}
+            >
+              RFP Document
+            </p>
             <FileDropZone
               file={rfpFile}
               onFile={setRfpFile}
               onRemove={() => setRfpFile(null)}
-              label="RFP Document"
             />
 
             {useComplianceStore.getState().error && (
@@ -78,8 +90,10 @@ export default function UploadRFP() {
             <button
               onClick={handleAnalyze}
               disabled={!rfpFile || loading}
-              className="w-full py-3 rounded-xl font-semibold text-sm tracking-wide transition-all duration-200"
+              className="w-full rounded-xl font-semibold text-sm tracking-wide transition-all duration-200"
               style={{
+                marginTop: "0.75rem",
+                padding: "0.85rem 1.5rem",
                 background: !rfpFile || loading
                   ? "rgba(17, 17, 24, 0.8)"
                   : "linear-gradient(135deg, #6366f1, #8b5cf6)",
