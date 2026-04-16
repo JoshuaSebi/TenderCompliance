@@ -77,7 +77,7 @@ export default function Landing() {
         </div>
 
         <div
-          className="px-3 py-1 rounded-full text-xs font-semibold tracking-wide"
+          className="px-3 py-1 rounded-full text-xs font-semibold w-24 text-center"
           style={{
             backgroundColor: "rgba(99,102,241,0.1)",
             color: "#818cf8",

@@ -30,7 +30,7 @@ export default function UploadBoth() {
   return (
     <div className="min-h-screen flex flex-col" style={{ backgroundColor: "#06060b" }}>
       {/* Nav */}
-      <nav className="w-full flex items-center justify-between px-8 py-5"
+      <nav className="w-full flex items-center justify-between px-8 py-5 h-8"
         style={{ borderBottom: "1px solid rgba(255,255,255,0.06)" }}
       >
         <button
@@ -46,13 +46,12 @@ export default function UploadBoth() {
           Back
         </button>
         <span
-          className="inline-flex items-center text-xs font-bold uppercase tracking-[0.1em] rounded-full"
+          className="px-3 py-1 rounded-full text-xs font-semibold w-43 text-center"
           style={{
             backgroundColor: "rgba(168,85,247,0.1)",
             color: "#a78bfa",
             border: "1px solid rgba(168,85,247,0.2)",
-            padding: "0.5rem 1rem",
-            lineHeight: "1.2",
+            lineHeight: "1.2"
           }}
         >
           Mode 2 — RFP + Proposal
