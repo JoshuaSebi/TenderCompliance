@@ -1,100 +1,143 @@
-import { ChatGroq } from "@langchain/groq";
-import { ChatPromptTemplate } from "@langchain/core/prompts";
-import { StringOutputParser } from "@langchain/core/output_parsers";
-import { RunnableSequence } from "@langchain/core/runnables";
+import Groq from "groq-sdk";
 
-const model = new ChatGroq({
-  apiKey: process.env.GROQ_API_KEY,
-  model: "qwen/qwen3-32b",
-  temperature: 0.2,
-});
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const validationPrompt = ChatPromptTemplate.fromMessages([
-  [
-    "system",
-    `You are a procurement compliance expert. You will receive a list of RFP requirements and a vendor proposal.
+const MODEL = "llama-3.3-70b-versatile";
 
-For EACH requirement, analyze the vendor proposal and determine:
-- status: "Met" (fully addressed), "Partial" (partially addressed), or "Missing" (not addressed at all)
-- matchedPassage: the relevant excerpt from the proposal that addresses this requirement, or null if Missing
-- confidenceScore: integer from 0 to 100 indicating how confident you are in your assessment
-
-Return ONLY valid JSON with this exact structure, no markdown fences:
-{{
-  "validationResults": [
-    {{
-      "requirementId": 1,
-      "requirement": "original requirement text",
-      "status": "Met",
-      "matchedPassage": "relevant excerpt from proposal",
-      "confidenceScore": 85,
-      "category": "Technical"
-    }}
-  ]
-}}`,
-  ],
-  [
-    "human",
-    `REQUIREMENTS:
-{requirements}
-
-VENDOR PROPOSAL:
-{proposalText}`,
-  ],
-]);
-
-const outputParser = new StringOutputParser();
-
-const chain = RunnableSequence.from([validationPrompt, model, outputParser]);
-
+// ─────────────────────────────────────────────
+// JSON Cleaner — handles fences, think tags, bracket mismatch
+// ─────────────────────────────────────────────
 function cleanJsonResponse(raw) {
-  let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-  cleaned = cleaned.replace(/```json\s*/gi, "").replace(/```\s*/g, "");
+  // 1. Strip <think>...</think> blocks (Qwen3, DeepSeek, etc.)
+  let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 
-  const jsonStart = cleaned.indexOf("{");
-  const jsonEnd = cleaned.lastIndexOf("}");
+  // 2. Strip markdown code fences
+  cleaned = cleaned
+    .replace(/^```(?:json)?\s*/im, "")
+    .replace(/```\s*$/im, "")
+    .trim();
 
-  if (jsonStart === -1 || jsonEnd === -1) {
-    throw new Error("No valid JSON found in response");
+  // 3. Bracket counter to find outermost { }
+  //    lastIndexOf("}") breaks on nested objects — never use it
+  const start = cleaned.indexOf("{");
+  if (start === -1) throw new Error("No JSON object found in response");
+
+  let depth = 0;
+  let end = -1;
+  for (let i = start; i < cleaned.length; i++) {
+    if (cleaned[i] === "{") depth++;
+    else if (cleaned[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
   }
 
-  return cleaned.substring(jsonStart, jsonEnd + 1);
+  if (end === -1) throw new Error("Malformed JSON: unmatched braces");
+
+  return cleaned.substring(start, end + 1);
 }
 
+// ─────────────────────────────────────────────
+// 🔹 Validate Vendor Proposal against RFP Requirements
+// ─────────────────────────────────────────────
 export async function validateRequirements(requirements, proposalText) {
   try {
+    // Format requirements list for the prompt
     const reqText = requirements
       .map((r) => `[ID:${r.id}] [${r.category}] ${r.text}`)
       .join("\n");
 
-    const raw = await chain.invoke({
-      requirements: reqText,
-      proposalText: proposalText.slice(0, 8000),
+    const chat = await groq.chat.completions.create({
+      model: MODEL,
+      temperature: 0, // zero creativity — deterministic compliance checking
+      messages: [
+        {
+          role: "system",
+          content: `You are a procurement compliance expert. You will receive a list of RFP requirements and a vendor proposal.
+
+For EACH requirement in the list, carefully read the vendor proposal and determine:
+
+- status:
+    "Met"     → vendor explicitly and fully addresses this requirement
+    "Partial" → vendor partially addresses it, or uses vague/non-committal language
+    "Missing" → vendor does not address it at all
+
+- matchedPassage: copy the EXACT sentence or passage from the vendor proposal that addresses this requirement. If Missing, use null.
+
+- confidenceScore: integer 0–100 indicating how confident you are in your assessment.
+    90–100 → very clear match or very clear absence
+    60–89  → reasonable match but some ambiguity
+    0–59   → uncertain, vague language in proposal
+
+RULES:
+- Base your assessment ONLY on the provided vendor proposal text
+- Do NOT assume or infer things the proposal does not explicitly state
+- If the proposal is vague or non-committal, mark as "Partial" not "Met"
+- matchedPassage must be copied verbatim from the proposal, not paraphrased
+
+Return ONLY a raw JSON object. No markdown. No code fences. No explanation. No text before or after.
+Start your response with { and end with }.
+
+JSON structure:
+{
+  "validationResults": [
+    {
+      "requirementId": 1,
+      "requirement": "original requirement text",
+      "status": "Met",
+      "matchedPassage": "exact verbatim excerpt from vendor proposal, or null",
+      "confidenceScore": 85,
+      "category": "Technical"
+    }
+  ]
+}`,
+        },
+        {
+          role: "user",
+          content: `Validate the vendor proposal against each RFP requirement below.
+
+REQUIREMENTS:
+${reqText}
+
+VENDOR PROPOSAL:
+${proposalText.slice(0, 8000)}`,
+        },
+      ],
     });
+
+    const raw = chat.choices[0].message.content;
+
+    // Debug — remove in production
+    console.log("Raw validation response (first 500):", raw.substring(0, 500));
 
     const cleaned = cleanJsonResponse(raw);
     const parsed = JSON.parse(cleaned);
 
-    if (
-      !parsed.validationResults ||
-      !Array.isArray(parsed.validationResults)
-    ) {
+    if (!parsed.validationResults || !Array.isArray(parsed.validationResults)) {
       throw new Error("Response missing validationResults array");
     }
 
-    // Normalize results
-    parsed.validationResults = parsed.validationResults.map((r) => ({
-      requirementId: r.requirementId,
-      requirement: r.requirement || "",
-      status: ["Met", "Partial", "Missing"].includes(r.status)
-        ? r.status
-        : "Missing",
-      matchedPassage: r.matchedPassage || null,
-      confidenceScore: Math.min(100, Math.max(0, r.confidenceScore || 0)),
-      category: r.category || "Technical",
-    }));
+    // Normalize and validate each result
+    parsed.validationResults = parsed.validationResults
+      .filter((r) => r.requirementId !== undefined)
+      .map((r) => ({
+        requirementId: r.requirementId,
+        requirement: r.requirement?.trim() || "",
+        status: ["Met", "Partial", "Missing"].includes(r.status)
+          ? r.status
+          : "Missing",
+        matchedPassage: r.matchedPassage?.trim() || null,
+        confidenceScore: typeof r.confidenceScore === "number"
+          ? Math.min(100, Math.max(0, r.confidenceScore))
+          : 50,
+        category: r.category?.trim() || "General",
+      }));
 
-    // Calculate overall score
+    // Calculate overall compliance score
+    // Met = full point, Partial = half point, Missing = 0
     const total = parsed.validationResults.length;
     const metCount = parsed.validationResults.filter(
       (r) => r.status === "Met"
@@ -102,15 +145,19 @@ export async function validateRequirements(requirements, proposalText) {
     const partialCount = parsed.validationResults.filter(
       (r) => r.status === "Partial"
     ).length;
+    const missingCount = total - metCount - partialCount;
+
     const score =
-      total > 0 ? Math.round(((metCount + partialCount * 0.5) / total) * 100) : 0;
+      total > 0
+        ? Math.round(((metCount + partialCount * 0.5) / total) * 100)
+        : 0;
 
     return {
       score,
       total,
       met: metCount,
       partial: partialCount,
-      missing: total - metCount - partialCount,
+      missing: missingCount,
       results: parsed.validationResults,
     };
   } catch (err) {

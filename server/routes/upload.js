@@ -12,8 +12,8 @@ router.post("/upload", upload.single("file"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ success: false, error: "No file uploaded" });
     }
-    const text = await extractText(req.file.buffer);
-    res.json({ success: true, text });
+    const { text, pageCount } = await extractText(req.file.buffer);
+    res.json({ success: true, text, pageCount });
   } catch (err) {
     console.error("Upload error:", err);
     res.status(500).json({ success: false, error: err.message });
@@ -26,8 +26,22 @@ router.post("/extract", upload.single("rfp"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ success: false, error: "No RFP file uploaded" });
     }
-    const rfpText = await extractText(req.file.buffer);
-    const result = await extractRequirements(rfpText);
+
+    const { text: rfpText, pageCount } = await extractText(req.file.buffer);
+
+    // ── ADD THESE 3 LINES ──
+    const obligationCount = (rfpText.match(/\b(shall|must|required|mandatory)\b/gi) || []).length;
+    console.log("Total chars:", rfpText.length);
+    console.log("Obligation keywords found:", obligationCount);
+    console.log("Page count:", pageCount);
+    // ── END DEBUG ──
+
+    const result = await extractRequirements(rfpText, { pageCount });
+
+    // ── ADD THIS TOO ──
+    console.log("Final requirements count:", result.requirements.length);
+    // ──────────────────
+
     res.json({ success: true, data: result });
   } catch (err) {
     console.error("Extract error:", err);

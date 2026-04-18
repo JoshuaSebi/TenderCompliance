@@ -1,6 +1,6 @@
 import useComplianceStore from "../store/complianceStore";
 
-const categories = ["All", "Technical", "Legal", "Financial"];
+const categories = ["All", "Technical", "Legal", "Financial","General"];
 
 export default function CategoryFilter() {
   const { activeFilter, setActiveFilter, requirements } = useComplianceStore();
