@@ -2,23 +2,19 @@ import Groq from "groq-sdk";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const MODEL = "llama-3.3-70b-versatile";
+const MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─────────────────────────────────────────────
-// JSON Cleaner — handles fences, think tags, bracket mismatch
+// JSON Cleaner
 // ─────────────────────────────────────────────
 function cleanJsonResponse(raw) {
-  // 1. Strip <think>...</think> blocks (Qwen3, DeepSeek, etc.)
   let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-
-  // 2. Strip markdown code fences
   cleaned = cleaned
     .replace(/^```(?:json)?\s*/im, "")
     .replace(/```\s*$/im, "")
     .trim();
 
-  // 3. Bracket counter to find outermost { }
-  //    lastIndexOf("}") breaks on nested objects — never use it
   const start = cleaned.indexOf("{");
   if (start === -1) throw new Error("No JSON object found in response");
 
@@ -28,56 +24,60 @@ function cleanJsonResponse(raw) {
     if (cleaned[i] === "{") depth++;
     else if (cleaned[i] === "}") {
       depth--;
-      if (depth === 0) {
-        end = i;
-        break;
-      }
+      if (depth === 0) { end = i; break; }
     }
   }
 
   if (end === -1) throw new Error("Malformed JSON: unmatched braces");
 
-  return cleaned.substring(start, end + 1);
+  return cleaned.substring(start, end + 1)
+    .replace(/[\u201C\u201D]/g, '\\"')
+    .replace(/[\u2018\u2019]/g, "'");
 }
 
 // ─────────────────────────────────────────────
-// 🔹 Analyze Vendor Proposal for Risk Red Flags
+// Scan one chunk of proposal text for red flags
 // ─────────────────────────────────────────────
-export async function analyzeRisks(proposalText) {
-  try {
-    const chat = await groq.chat.completions.create({
-      model: MODEL,
-      temperature: 0, // deterministic — risk detection must be consistent
-      messages: [
-        {
-          role: "system",
-          content: `You are a legal risk analyst specializing in vendor proposals and contracts.
+async function scanChunk(chunkText, chunkIndex, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const chat = await groq.chat.completions.create({
+        model: MODEL,
+        temperature: 0,
+        max_tokens: 4000,
+        messages: [
+          {
+            role: "system",
+            content: `You are a legal risk analyst specializing in vendor proposals and contracts.
 
-Scan the vendor proposal for red-flag phrases, risky language, or concerning terms.
+Scan the vendor proposal text for red-flag phrases, risky language, or concerning terms.
 
 Look specifically for:
-- Vague commitments: "best effort", "where possible", "may", "subject to", "as applicable"
-- Liability limitations: "limited liability", "not liable", "no responsibility"
-- Unclear or missing timelines: no specific dates, "to be determined", "as agreed"
-- Missing guarantees: no SLA, no penalty clause, no performance bond
-- Clauses that favour the vendor: unilateral termination rights, price change rights
-- Non-compliance signals: contradictions with RFP terms, omissions of mandatory requirements
-- Hidden cost traps: "additional fees may apply", "subject to change", "extra charges"
+- Vague commitments: "best effort", "where possible", "may", "subject to", "as applicable", "reasonable endeavours"
+- Liability limitations: "limited liability", "not liable", "no responsibility", "liability capped at"
+- Unclear or missing timelines: "to be determined", "as mutually agreed", no specific dates for critical milestones
+- Missing guarantees: absence of SLA commitments, no penalty clause, no performance bond reference
+- Clauses that favour the vendor: unilateral termination rights, unilateral price change rights, right to subcontract without approval
+- Non-compliance signals: language that contradicts RFP requirements, qualifications on mandatory obligations
+- Hidden cost traps: "additional fees may apply", "subject to change", "extra charges for", "out of scope"
+- Exclusion clauses: "not responsible for", "excludes", "does not cover", "except where"
 
-For each red flag:
-- sentence: copy the EXACT sentence from the proposal word for word — do not paraphrase
-- riskLevel: "High" (could cause legal/financial damage), "Medium" (ambiguous, needs clarification), "Low" (minor concern)
-- explanation: brief explanation of why this is a risk to the buyer
+For each red flag found:
+- sentence: copy the EXACT sentence from the proposal word for word — do not paraphrase or shorten
+- riskLevel: 
+    "High"   → could cause direct legal or financial damage if unchallenged
+    "Medium" → ambiguous language that needs clarification before signing
+    "Low"    → minor concern worth noting but unlikely to cause serious harm
+- explanation: one or two sentences explaining why this is a risk to the buyer
 
-RULES:
-- Only flag sentences that are actually in the provided proposal text
-- Do NOT invent or fabricate red flags
-- If no red flags exist, return an empty array
+STRICT RULES:
+- Only flag sentences actually present in the provided text
+- Do NOT invent, fabricate, or infer red flags
+- Do NOT flag standard boilerplate that is universally acceptable
+- If no red flags exist in this text, return an empty array
 
-Return ONLY a raw JSON object. No markdown. No code fences. No explanation. No text before or after.
-Start your response with { and end with }.
+Return ONLY raw JSON. No markdown. No fences. Start { end }.
 
-JSON structure:
 {
   "redFlags": [
     {
@@ -88,72 +88,122 @@ JSON structure:
   ]
 }
 
-If no red flags found:
-{
-  "redFlags": []
-}`,
-        },
-        {
-          role: "user",
-          content: `Scan the following vendor proposal for risk red flags. Copy flagged sentences VERBATIM.
+If no red flags found: { "redFlags": [] }`,
+          },
+          {
+            role: "user",
+            content: `Scan the following vendor proposal text for risk red flags. Copy flagged sentences VERBATIM.\n\nVendor Proposal:\n${chunkText}`,
+          },
+        ],
+      });
 
-Vendor Proposal:
-${proposalText.slice(0, 8000)}`,
-        },
-      ],
-    });
+      const raw = chat.choices[0].message.content;
+      console.log(`[Risk] Chunk ${chunkIndex + 1} (first 150): ${raw.substring(0, 150)}`);
 
-    const raw = chat.choices[0].message.content;
+      const cleaned = cleanJsonResponse(raw);
+      const parsed = JSON.parse(cleaned);
 
-    // Debug — remove in production
-    console.log("Raw risk response (first 500):", raw.substring(0, 500));
+      if (!parsed.redFlags || !Array.isArray(parsed.redFlags)) return [];
 
-    const cleaned = cleanJsonResponse(raw);
-    const parsed = JSON.parse(cleaned);
+      return parsed.redFlags.filter((f) => f.sentence?.trim().length > 0);
 
-    if (!parsed.redFlags || !Array.isArray(parsed.redFlags)) {
-      return { redFlags: [] };
+    } catch (err) {
+      if (err.status === 429 || err.message?.includes("429")) {
+        const waitMatch = err.message?.match(/try again in ([\d.]+)s/);
+        const waitMs = waitMatch
+          ? Math.ceil(parseFloat(waitMatch[1]) * 1000) + 500
+          : attempt * 3000;
+        console.warn(`[Risk] Chunk ${chunkIndex + 1} rate limited. Waiting ${waitMs}ms...`);
+        await sleep(waitMs);
+        continue;
+      }
+
+      console.error(`[Risk] Chunk ${chunkIndex + 1} failed (attempt ${attempt}): ${err.message}`);
+      if (attempt === retries) return [];
+      await sleep(1000 * attempt);
+    }
+  }
+
+  return [];
+}
+
+// ─────────────────────────────────────────────
+// Deduplicate red flags by sentence fingerprint
+// ─────────────────────────────────────────────
+function deduplicateFlags(flags) {
+  const seen = new Set();
+  return flags.filter((f) => {
+    const fp = f.sentence.toLowerCase().replace(/\s+/g, " ").substring(0, 80);
+    if (seen.has(fp)) return false;
+    seen.add(fp);
+    return true;
+  });
+}
+
+// ─────────────────────────────────────────────
+// Main export
+// ─────────────────────────────────────────────
+export async function analyzeRisks(proposalText) {
+  try {
+    if (!proposalText || proposalText.trim().length < 50) {
+      return { redFlags: [], summary: { total: 0, high: 0, medium: 0, low: 0 } };
     }
 
-    // Normalize and validate each flag
-    parsed.redFlags = parsed.redFlags
-      .filter((flag) => flag.sentence && flag.sentence.trim().length > 0)
-      .map((flag) => ({
-        sentence: flag.sentence.trim(),
-        riskLevel: ["Low", "Medium", "High"].includes(flag.riskLevel)
-          ? flag.riskLevel
-          : "Medium",
-        explanation: flag.explanation?.trim() || "No explanation provided",
-      }));
+    // Split into 4000-char chunks with 300-char overlap
+    // so red flags near chunk boundaries are not missed
+    const CHUNK_SIZE = 4000;
+    const OVERLAP = 300;
+    const chunks = [];
+    let start = 0;
 
-    // Sort by risk level: High → Medium → Low
+    while (start < proposalText.length) {
+      chunks.push(proposalText.slice(start, start + CHUNK_SIZE));
+      start += CHUNK_SIZE - OVERLAP;
+    }
+
+    console.log(`[Risk] Scanning ${proposalText.length} chars in ${chunks.length} chunk(s)`);
+
+    // Scan chunks sequentially to respect rate limits
+    const allFlags = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const flags = await scanChunk(chunks[i], i);
+      allFlags.push(...flags);
+
+      if (i < chunks.length - 1) {
+        await sleep(10000); // respect TPM limit between chunks
+      }
+    }
+
+    // Deduplicate flags that appeared in overlapping chunks
+    const unique = deduplicateFlags(allFlags);
+
+    // Normalize each flag
+    const normalized = unique.map((flag) => ({
+      sentence:    flag.sentence.trim(),
+      riskLevel:   ["Low", "Medium", "High"].includes(flag.riskLevel)
+                     ? flag.riskLevel
+                     : "Medium",
+      explanation: flag.explanation?.trim() || "No explanation provided",
+    }));
+
+    // Sort High → Medium → Low
     const riskOrder = { High: 0, Medium: 1, Low: 2 };
-    parsed.redFlags.sort(
-      (a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]
-    );
+    normalized.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
 
-    // Summary counts
-    const high = parsed.redFlags.filter((f) => f.riskLevel === "High").length;
-    const medium = parsed.redFlags.filter(
-      (f) => f.riskLevel === "Medium"
-    ).length;
-    const low = parsed.redFlags.filter((f) => f.riskLevel === "Low").length;
+    const high   = normalized.filter((f) => f.riskLevel === "High").length;
+    const medium = normalized.filter((f) => f.riskLevel === "Medium").length;
+    const low    = normalized.filter((f) => f.riskLevel === "Low").length;
+
+    console.log(`[Risk] Found: ${high} High, ${medium} Medium, ${low} Low`);
 
     return {
-      redFlags: parsed.redFlags,
-      summary: {
-        total: parsed.redFlags.length,
-        high,
-        medium,
-        low,
-      },
+      redFlags: normalized,
+      summary: { total: normalized.length, high, medium, low },
     };
+
   } catch (err) {
     console.error("Risk chain error:", err.message);
-    // Don't throw — return empty so validation still works even if risk scan fails
-    return {
-      redFlags: [],
-      summary: { total: 0, high: 0, medium: 0, low: 0 },
-    };
+    // Never throw — risk scan failure should not block validation results
+    return { redFlags: [], summary: { total: 0, high: 0, medium: 0, low: 0 } };
   }
 }
