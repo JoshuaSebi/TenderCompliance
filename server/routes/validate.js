@@ -8,30 +8,56 @@ import { analyzeRisks } from "../chains/riskChain.js";
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Mode 2 — Validate RFP against Vendor Proposal
 router.post(
   "/validate",
   upload.fields([{ name: "rfp" }, { name: "vendor" }]),
   async (req, res) => {
     try {
+      // Validate files exist
       if (!req.files?.rfp?.[0] || !req.files?.vendor?.[0]) {
-        return res
-          .status(400)
-          .json({ success: false, error: "Both RFP and vendor files required" });
+        return res.status(400).json({
+          success: false,
+          error: "Both RFP and vendor files required",
+        });
       }
 
-      const rfpText = await extractText(req.files["rfp"][0].buffer);
-      const vendorText = await extractText(req.files["vendor"][0].buffer);
+      // Extract text
+      let rfpText = await extractText(req.files["rfp"][0].buffer);
+      let vendorText = await extractText(req.files["vendor"][0].buffer);
 
-      // Step 1: Extract requirements from RFP
-      const { requirements } = await extractRequirements(rfpText);
+      // CRITICAL FIX → ensure strings
+      rfpText = String(rfpText || "").trim();
+      vendorText = String(vendorText || "").trim();
 
-      // Step 2: Validate each requirement against proposal
+      // Debug (optional)
+      console.log("RFP type:", typeof rfpText);
+      console.log("Vendor type:", typeof vendorText);
+
+      // Prevent empty input
+      if (!rfpText) {
+        throw new Error("RFP text extraction failed");
+      }
+
+      if (!vendorText) {
+        throw new Error("Vendor text extraction failed");
+      }
+
+      // Step 1: Extract requirements
+      const extractionResult = await extractRequirements(rfpText);
+
+      if (!extractionResult?.requirements) {
+        throw new Error("Failed to extract requirements");
+      }
+
+      const { requirements } = extractionResult;
+
+      // Step 2: Validate
       const validation = await validateRequirements(requirements, vendorText);
 
-      // Step 3: Scan proposal for red flags
+      // Step 3: Risk analysis
       const risks = await analyzeRisks(vendorText);
 
+      // Response
       res.json({
         success: true,
         data: {
@@ -44,9 +70,14 @@ router.post(
           redFlags: risks.redFlags,
         },
       });
+
     } catch (err) {
       console.error("Validate error:", err);
-      res.status(500).json({ success: false, error: err.message });
+
+      res.status(500).json({
+        success: false,
+        error: err.message || "Validation failed",
+      });
     }
   }
 );
