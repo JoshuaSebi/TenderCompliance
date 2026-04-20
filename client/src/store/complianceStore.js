@@ -6,6 +6,11 @@ const useComplianceStore = create((set) => ({
   setRequirements: (reqs) => set({ requirements: reqs }),
   clearRequirements: () => set({ requirements: [] }),
 
+  // Unsure requirements — AI couldn't fully verify these
+  unsureRequirements: [],
+  setUnsureRequirements: (reqs) => set({ unsureRequirements: reqs }),
+  clearUnsureRequirements: () => set({ unsureRequirements: [] }),
+
   // Category filter
   activeFilter: "All",
   setActiveFilter: (filter) => set({ activeFilter: filter }),
@@ -28,6 +33,7 @@ const useComplianceStore = create((set) => ({
   reset: () =>
     set({
       requirements: [],
+      unsureRequirements: [],
       activeFilter: "All",
       validationData: null,
       loading: false,

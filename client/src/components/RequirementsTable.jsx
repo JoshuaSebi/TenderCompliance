@@ -24,16 +24,9 @@ const keywordStyles = {
   MAY: "#34d399",
 };
 
-export default function RequirementsTable({ filtered }) {
-  return (
-    <div
-      style={{
-        background: "rgba(255,255,255,0.02)",
-        border: "1px solid rgba(255,255,255,0.07)",
-        borderRadius: "16px",
-        overflow: "hidden",
-      }}
-    >
+export default function RequirementsTable({ filtered, noWrapper }) {
+  const content = (
+    <>
       {/* Table Header */}
       <div
         style={{
@@ -199,6 +192,21 @@ export default function RequirementsTable({ filtered }) {
           </p>
         </div>
       )}
+    </>
+  );
+
+  if (noWrapper) return content;
+
+  return (
+    <div
+      style={{
+        background: "rgba(255,255,255,0.02)",
+        border: "1px solid rgba(255,255,255,0.07)",
+        borderRadius: "16px",
+        overflow: "hidden",
+      }}
+    >
+      {content}
     </div>
   );
 }

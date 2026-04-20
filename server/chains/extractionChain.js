@@ -6,7 +6,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const EXTRACT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 const VALID_CATEGORIES = ["Technical", "Legal", "Financial", "General"];
-const VALID_KEYWORDS = ["shall", "must", "required", "mandatory"];
+const VALID_KEYWORDS   = ["shall", "must", "required", "mandatory"];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -23,8 +23,7 @@ function cleanJsonResponse(raw) {
   const start = cleaned.indexOf("{");
   if (start === -1) throw new Error("No JSON object found in response");
 
-  let depth = 0;
-  let end = -1;
+  let depth = 0, end = -1;
   for (let i = start; i < cleaned.length; i++) {
     if (cleaned[i] === "{") depth++;
     else if (cleaned[i] === "}") {
@@ -57,7 +56,6 @@ function cleanPdfText(text) {
 
 // ─────────────────────────────────────────────
 // STEP 2: Smart segment extractor
-// Finds obligation candidates using regex — no AI, instant
 // ─────────────────────────────────────────────
 function extractSegments(text) {
   const segments = [];
@@ -74,8 +72,6 @@ function extractSegments(text) {
       continue;
     }
 
-    // Long paragraph — split carefully at sentence boundaries
-    // Negative lookbehind prevents splitting on abbreviations like Rs. Cl. No.
     const sentences = trimmed
       .split(/(?<!\b(?:Rs|Cl|No|Mr|Dr|St|vs|ie|eg|etc|viz|Sr|Jr)\b)(?<=\.)\s+/)
       .map((s) => s.trim())
@@ -84,7 +80,6 @@ function extractSegments(text) {
     segments.push(...sentences);
   }
 
-  // Deduplicate by 80-char fingerprint
   const seen = new Set();
   const unique = segments.filter((s) => {
     const fp = s.toLowerCase().replace(/\s+/g, " ").substring(0, 80);
@@ -98,11 +93,12 @@ function extractSegments(text) {
 }
 
 // ─────────────────────────────────────────────
-// STEP 3: Classify one batch with retry
+// STEP 3: Classify batch — exported so extractionGraph can reuse it
+// Single source of truth for the classification prompt
 // ─────────────────────────────────────────────
 export async function classifyBatch(segments, batchIndex, retries = 3) {
   const sanitized = segments.map((s) => s.replace(/"/g, "'"));
-  const numbered = sanitized.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  const numbered  = sanitized.map((s, i) => `${i + 1}. ${s}`).join("\n");
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -128,31 +124,22 @@ SKIP — do NOT include these
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Definitions and glossary entries
    ("X shall mean Y", "X shall have the meaning", "for the purposes of this RFP")
-
 2. Descriptive or background text
    (explains context, history, or purpose with no actionable obligation)
-
 3. Authority discretion and reserved rights
    ("the Authority/Client/Utility may", "reserves the right to", "at its sole discretion")
-
 4. Evaluation methodology descriptions
    (how the Authority will score or evaluate bids — obligations on the Authority, not the Bidder)
-
 5. Scoring formulas and weightages
    ("Technical Score 70% + Financial Score 30%", "QCBS methodology")
-
 6. Introductory list headers without standalone obligation
    ("The Bidder must include the following:" — skip the header, include the list items only if they follow)
-
 7. Administrative and contact information
    (addresses, email, phone numbers, submission office details)
-
 8. Permission statements — rights given TO the Bidder, not obligations ON the Bidder
    ("A Bidder may modify or withdraw its Bid" — this is a right, not a requirement)
-
 9. Penalty or consequence caps that limit the Authority's actions
    ("aggregate penalties shall not exceed X%" — this constrains the Authority, not the Bidder)
-
 10. Pure informational references
     ("Bidders shall refer to Annexure A" — informational direction, not an actionable obligation)
 
@@ -232,14 +219,13 @@ If no segments qualify: { "requirements": [] }`,
       }
 
       const cleaned = cleanJsonResponse(raw);
-      const parsed = JSON.parse(cleaned);
+      const parsed  = JSON.parse(cleaned);
 
       if (!parsed.requirements || !Array.isArray(parsed.requirements)) return [];
 
       return parsed.requirements.filter((r) => r.text?.trim().length > 0);
 
     } catch (err) {
-      // Rate limit — wait exact retry time from error message
       if (err.status === 429 || err.message?.includes("429")) {
         const waitMatch = err.message?.match(/try again in ([\d.]+)s/);
         const waitMs = waitMatch
@@ -250,18 +236,13 @@ If no segments qualify: { "requirements": [] }`,
         continue;
       }
 
-      // Model decommissioned — fail immediately, no point retrying
       if (err.status === 400 && err.message?.includes("decommissioned")) {
         console.error("Model decommissioned. Update EXTRACT_MODEL in extractionChain.js");
         throw err;
       }
 
-      // Other error — backoff and retry
       console.error(`Batch ${batchIndex + 1} failed (attempt ${attempt}): ${err.message}`);
-      if (attempt === retries) {
-        console.error(`Batch ${batchIndex + 1} permanently failed after ${retries} attempts`);
-        return [];
-      }
+      if (attempt === retries) return [];
       await sleep(1000 * attempt);
     }
   }
@@ -270,7 +251,7 @@ If no segments qualify: { "requirements": [] }`,
 }
 
 // ─────────────────────────────────────────────
-// STEP 4: Scanned PDF detection
+// Scanned PDF detection
 // ─────────────────────────────────────────────
 function detectScannedPdf(text, pageCount) {
   const avg = text.length / Math.max(pageCount || 1, 1);
@@ -306,43 +287,42 @@ export async function extractRequirements(rfpText, options = {}) {
     console.log("========================\n");
 
     const cleanedText = cleanPdfText(rfpText);
-    const candidates = extractSegments(cleanedText);
+    const candidates  = extractSegments(cleanedText);
 
     if (candidates.length === 0) {
       return {
-        requirements: [],
+        requirements:       [],
+        unsureRequirements: [],
         warning: "No obligation keywords found. Check PDF text extraction.",
       };
     }
 
-    // ── MODE A: LangGraph pipeline (extract + verify + re-extract) ──
-    // Recommended — catches hallucinations automatically
+    // ── MODE A: LangGraph with verification + unsure tracking ──
     if (useVerification) {
       console.log(`Passing ${candidates.length} candidates to LangGraph pipeline...`);
       const result = await extractWithVerification(rfpText, candidates);
 
       console.log(`\n=== DONE ===`);
       console.log(`Candidates  : ${candidates.length}`);
-      console.log(`Extracted   : ${result.requirements.length}`);
+      console.log(`Verified    : ${result.requirements.length}`);
+      console.log(`Unsure      : ${result.unsureRequirements?.length || 0}`);
       if (result.stats) {
         console.log(`Hallucinations : ${result.stats.hallucinationsDetected}`);
         console.log(`Recovered      : ${result.stats.recovered}`);
       }
       console.log(`============\n`);
 
-      return result;
+      return result; // includes requirements, unsureRequirements, stats
     }
 
-    // ── MODE B: Direct classify without verification ──
-    // Faster but no hallucination checking
-    // Use when: testing, rate limit issues, or speed is priority
+    // ── MODE B: Direct classify (no verification) ──
     const BATCH_SIZE = 5;
     const batches = [];
     for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
       batches.push(candidates.slice(i, i + BATCH_SIZE));
     }
 
-    console.log(`Direct mode: ${candidates.length} candidates → ${batches.length} batches of ${BATCH_SIZE}`);
+    console.log(`Direct mode: ${candidates.length} candidates → ${batches.length} batches`);
 
     const allResults = [];
     for (let i = 0; i < batches.length; i++) {
@@ -357,12 +337,14 @@ export async function extractRequirements(rfpText, options = {}) {
     const normalized = allResults
       .flat()
       .map((req, idx) => ({
-        id: idx + 1,
-        text: req.text.trim(),
+        id:       idx + 1,
+        text:     req.text.trim(),
         category: VALID_CATEGORIES.includes(req.category) ? req.category : "General",
-        keyword: VALID_KEYWORDS.includes(req.keyword?.toLowerCase())
-          ? req.keyword.toLowerCase()
-          : "required",
+        keyword:  VALID_KEYWORDS.includes(req.keyword?.toLowerCase())
+                    ? req.keyword.toLowerCase()
+                    : "required",
+        verified: false, // not verified in direct mode
+        unsure:   false,
       }));
 
     console.log(`\n=== DONE ===`);
@@ -370,7 +352,10 @@ export async function extractRequirements(rfpText, options = {}) {
     console.log(`Extracted  : ${normalized.length}`);
     console.log(`============\n`);
 
-    return { requirements: normalized };
+    return {
+      requirements:       normalized,
+      unsureRequirements: [],
+    };
 
   } catch (err) {
     console.error("Extraction error:", err.message);

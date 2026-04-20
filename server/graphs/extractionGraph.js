@@ -1,35 +1,70 @@
 import Groq from "groq-sdk";
 import { StateGraph, END } from "@langchain/langgraph";
 import { Annotation } from "@langchain/langgraph";
-
-// Import the shared classifyBatch from extractionChain
-// This ensures BOTH the direct path and the graph path use the EXACT same prompt
-// No duplication — one prompt to maintain
 import { classifyBatch } from "../chains/extractionChain.js";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
 const MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─────────────────────────────────────────────
-// Graph State Definition
+// Graph State
+// Key fix: confirmedRequirements uses array concat reducer
+// so verified items ACCUMULATE across verify cycles instead of being replaced
 // ─────────────────────────────────────────────
 const GraphState = Annotation.Root({
   // Input
   sourceText: Annotation({ reducer: (a, b) => b ?? a }),
   segments:   Annotation({ reducer: (a, b) => b ?? a }),
 
-  // Intermediate
-  extracted:            Annotation({ reducer: (a, b) => b ?? a }),
-  verificationResults:  Annotation({ reducer: (a, b) => b ?? a }),
-  failedRequirements:   Annotation({ reducer: (a, b) => b ?? a }),
-  reextracted:          Annotation({ reducer: (a, b) => b ?? a }),
+  // The full extracted list (replaced each cycle)
+  extracted: Annotation({ reducer: (a, b) => b ?? a }),
 
-  // Output
+  // ── KEY FIX ──
+  // confirmedRequirements ACCUMULATES across all verify cycles
+  // Using concat reducer so each cycle ADDS to the list, never replaces
+  confirmedRequirements: Annotation({
+    reducer: (a, b) => {
+      if (!a) return b || [];
+      if (!b) return a;
+      // Merge and deduplicate by 80-char fingerprint
+      const seen = new Set(a.map((r) => r.text.toLowerCase().replace(/\s+/g, " ").substring(0, 80)));
+      const newItems = b.filter((r) => {
+        const fp = r.text.toLowerCase().replace(/\s+/g, " ").substring(0, 80);
+        if (seen.has(fp)) return false;
+        seen.add(fp);
+        return true;
+      });
+      return [...a, ...newItems];
+    },
+    default: () => [],
+  }),
+
+  // Requirements still pending verification (replaced each cycle)
+  pendingRequirements: Annotation({ reducer: (a, b) => b ?? a }),
+
+  // Unsure requirements — accumulates across cycles
+  unsureRequirements: Annotation({
+    reducer: (a, b) => {
+      if (!a) return b || [];
+      if (!b) return a;
+      const seen = new Set(a.map((r) => r.text.toLowerCase().replace(/\s+/g, " ").substring(0, 80)));
+      const newItems = b.filter((r) => {
+        const fp = r.text.toLowerCase().replace(/\s+/g, " ").substring(0, 80);
+        if (seen.has(fp)) return false;
+        seen.add(fp);
+        return true;
+      });
+      return [...a, ...newItems];
+    },
+    default: () => [],
+  }),
+
+  // Final output
   finalRequirements: Annotation({ reducer: (a, b) => b ?? a }),
 
   // Control
+  retryMap:   Annotation({ reducer: (a, b) => b ?? a, default: () => ({}) }),
   retryCount: Annotation({ reducer: (a, b) => b ?? a, default: () => 0 }),
   maxRetries: Annotation({ reducer: (a, b) => b ?? a, default: () => 2 }),
 });
@@ -63,10 +98,11 @@ function cleanJson(raw) {
     .replace(/[\u2018\u2019]/g, "'");
 }
 
+const fingerprint = (text) =>
+  text.toLowerCase().replace(/\s+/g, " ").trim().substring(0, 80);
+
 // ─────────────────────────────────────────────
 // NODE 1: Extract
-// Uses the shared classifyBatch from extractionChain
-// so the prompt is always in sync — change it once, affects both paths
 // ─────────────────────────────────────────────
 async function extractNode(state) {
   console.log("\n[Node: Extract] Processing", state.segments.length, "segments");
@@ -75,10 +111,8 @@ async function extractNode(state) {
   const results = [];
 
   for (let i = 0; i < state.segments.length; i += BATCH_SIZE) {
-    const batch = state.segments.slice(i, i + BATCH_SIZE);
+    const batch      = state.segments.slice(i, i + BATCH_SIZE);
     const batchIndex = Math.floor(i / BATCH_SIZE);
-
-    // Reuse classifyBatch from extractionChain — single source of truth for the prompt
     const classified = await classifyBatch(batch, batchIndex);
     results.push(...classified);
 
@@ -89,30 +123,45 @@ async function extractNode(state) {
   }
 
   console.log(`[Extract] Got ${results.length} requirements`);
-  return { extracted: results };
+
+  return {
+    extracted:           results,
+    pendingRequirements: results, // all go to verify on first pass
+  };
 }
 
 // ─────────────────────────────────────────────
 // NODE 2: Verify
-// Second AI agent checks if each requirement is verbatim
+// Only verifies pendingRequirements (not the full list again)
+// Confirmed ones get added to confirmedRequirements accumulator
 // ─────────────────────────────────────────────
 async function verifyNode(state) {
-  console.log("\n[Node: Verify] Checking", state.extracted.length, "requirements");
+  // Only check requirements that are still pending
+  const toVerify = state.pendingRequirements || [];
+  console.log(`\n[Node: Verify] Checking ${toVerify.length} pending requirements`);
 
-  const requirements = state.extracted;
-  const sourceText = state.sourceText;
+  if (toVerify.length === 0) {
+    console.log("[Verify] Nothing to verify");
+    return {
+      pendingRequirements: [],
+    };
+  }
 
-  const BATCH_SIZE = 10;
-  const verificationResults = [];
+  const sourceText        = state.sourceText;
+  const retryMap          = state.retryMap || {};
+  const MAX_RETRIES_PER_REQ = 3;
+  const BATCH_SIZE          = 10;
 
-  for (let i = 0; i < requirements.length; i += BATCH_SIZE) {
-    const batch = requirements.slice(i, i + BATCH_SIZE);
+  const newlyConfirmed = [];
+  const stillFailed    = [];
+  const newlyUnsure    = [];
 
+  for (let i = 0; i < toVerify.length; i += BATCH_SIZE) {
+    const batch = toVerify.slice(i, i + BATCH_SIZE);
     const reqList = batch
       .map((r, idx) => `[${idx + 1}] "${r.text}"`)
       .join("\n");
 
-    // Use first 15000 chars of source — enough for most documents
     const sourceSnippet = sourceText.substring(0, 15000);
 
     try {
@@ -142,16 +191,8 @@ Be strict about actual word changes, additions, or omissions.
 Return ONLY raw JSON. No markdown. Start { end }.
 {
   "verifications": [
-    {
-      "index": 1,
-      "verdict": "verbatim",
-      "issue": null
-    },
-    {
-      "index": 2,
-      "verdict": "paraphrased",
-      "issue": "Source says 'X' but extracted says 'Y'"
-    }
+    { "index": 1, "verdict": "verbatim", "issue": null },
+    { "index": 2, "verdict": "paraphrased", "issue": "Source says X but extracted says Y" }
   ]
 }`,
           },
@@ -162,63 +203,86 @@ Return ONLY raw JSON. No markdown. Start { end }.
         ],
       });
 
-      const raw = chat.choices[0].message.content;
+      const raw    = chat.choices[0].message.content;
       const parsed = JSON.parse(cleanJson(raw));
 
       if (Array.isArray(parsed.verifications)) {
         parsed.verifications.forEach((v) => {
           const req = batch[v.index - 1];
-          if (req) {
-            verificationResults.push({
+          if (!req) return;
+
+          const fp           = fingerprint(req.text);
+          const timesRetried = retryMap[fp] || 0;
+
+          if (v.verdict === "verbatim") {
+            // ✅ Confirmed — add to accumulator
+            newlyConfirmed.push({ ...req, verdict: "verbatim", verified: true, unsure: false });
+          } else if (timesRetried >= MAX_RETRIES_PER_REQ) {
+            // ❌ Hit retry limit — mark as unsure
+            console.warn(`[Verify] Retry limit hit for: "${req.text.substring(0, 60)}..." → UNSURE`);
+            newlyUnsure.push({
+              ...req,
+              verdict:  "unsure",
+              issue:    v.issue || "Could not verify after maximum retries",
+              verified: false,
+              unsure:   true,
+            });
+          } else {
+            // ❌ Failed but can retry
+            stillFailed.push({
               ...req,
               verdict: v.verdict,
-              issue: v.issue || null,
-              verified: v.verdict === "verbatim",
+              issue:   v.issue || null,
+              verified: false,
+              unsure:   false,
             });
           }
         });
       }
     } catch (err) {
-      console.error(`[Verify] Batch ${Math.floor(i / BATCH_SIZE) + 1} failed:`, err.message);
-      // If verification fails, mark all as verified to avoid losing valid data
-      batch.forEach((req) => {
-        verificationResults.push({ ...req, verdict: "unknown", verified: true });
-      });
+      console.error(`[Verify] Batch failed:`, err.message);
+      // API failure — treat all as confirmed to avoid data loss
+      batch.forEach((req) => newlyConfirmed.push({ ...req, verdict: "unknown", verified: true, unsure: false }));
     }
 
-    if (i + BATCH_SIZE < requirements.length) {
+    if (i + BATCH_SIZE < toVerify.length) {
       console.log(`[Verify] Waiting 10s before next batch...`);
       await sleep(10000);
     }
   }
 
-  const passed = verificationResults.filter((r) => r.verified).length;
-  const failed = verificationResults.filter((r) => !r.verified).length;
+  // Update retryMap for failed requirements
+  const updatedRetryMap = { ...retryMap };
+  stillFailed.forEach((r) => {
+    const fp = fingerprint(r.text);
+    updatedRetryMap[fp] = (updatedRetryMap[fp] || 0) + 1;
+  });
 
-  console.log(`[Verify] Passed: ${passed} | Failed (hallucinated): ${failed}`);
+  console.log(`[Verify] Confirmed: ${newlyConfirmed.length} | Failed: ${stillFailed.length} | Unsure: ${newlyUnsure.length}`);
+  console.log(`[Verify] Total confirmed so far: ${(state.confirmedRequirements || []).length + newlyConfirmed.length}`);
 
   return {
-    verificationResults,
-    failedRequirements: verificationResults.filter((r) => !r.verified),
+    confirmedRequirements: newlyConfirmed, // reducer accumulates these
+    unsureRequirements:    newlyUnsure,    // reducer accumulates these
+    pendingRequirements:   stillFailed,    // replaced — only failed ones remain
+    retryMap:              updatedRetryMap,
   };
 }
 
 // ─────────────────────────────────────────────
 // NODE 3: Re-extract
-// For hallucinated requirements, find the source context and re-extract verbatim
+// Only processes stillFailed (pendingRequirements)
 // ─────────────────────────────────────────────
 async function reExtractNode(state) {
-  const failed = state.failedRequirements;
-  console.log(`\n[Node: Re-extract] Retrying ${failed.length} hallucinated requirements`);
+  const failed = state.pendingRequirements || [];
+  console.log(`\n[Node: Re-extract] Retrying ${failed.length} requirements`);
 
-  if (failed.length === 0) return { reextracted: [] };
+  if (failed.length === 0) return { pendingRequirements: [] };
 
   const reextracted = [];
 
   for (const req of failed) {
-    // Find the source context by searching for the first 5 words of the hallucinated text
-    // Even if it's paraphrased, the first few words often match
-    const words = req.text.split(" ").slice(0, 5).join(" ");
+    const words       = req.text.split(" ").slice(0, 5).join(" ");
     const sourceIndex = state.sourceText.toLowerCase().indexOf(words.toLowerCase());
 
     let context = "";
@@ -230,7 +294,15 @@ async function reExtractNode(state) {
     }
 
     if (!context) {
-      console.log(`[Re-extract] No source context found for: "${req.text.substring(0, 50)}..."`);
+      console.log(`[Re-extract] No source context for: "${req.text.substring(0, 50)}..." → unsure`);
+      // No context — move directly to unsure, don't keep retrying
+      reextracted.push({
+        ...req,
+        verdict:  "unsure",
+        issue:    "Could not locate source context for re-extraction",
+        verified: false,
+        unsure:   true,
+      });
       continue;
     }
 
@@ -244,15 +316,12 @@ async function reExtractNode(state) {
             role: "system",
             content: `You are a strict verbatim text extractor.
 
-You will receive a short excerpt from a source document.
-Your job: find and copy the obligation sentence CHARACTER FOR CHARACTER — do not change a single word.
+Find and copy the obligation sentence CHARACTER FOR CHARACTER from the source text.
+- Must contain "shall", "must", "required", or "mandatory"
+- Copy exactly — no rewording, no shortening
+- Include all sub-items (a)(b)(c) if present
 
-Rules:
-- The sentence must contain "shall", "must", "required", or "mandatory"
-- Copy it exactly as it appears — no rewording, no shortening, no paraphrasing
-- If the text contains sub-items (a)(b)(c), include them all
-
-Return ONLY raw JSON. No markdown.
+Return ONLY raw JSON:
 { "text": "exact sentence here", "category": "Technical|Financial|Legal|General", "keyword": "shall" }
 If no obligation sentence found: { "text": null }`,
           },
@@ -263,92 +332,154 @@ If no obligation sentence found: { "text": null }`,
         ],
       });
 
-      const raw = chat.choices[0].message.content;
+      const raw    = chat.choices[0].message.content;
       const parsed = JSON.parse(cleanJson(raw));
 
       if (parsed.text && parsed.text.trim()) {
+        // Successfully re-extracted — goes back into pending for re-verification
         reextracted.push({
-          text: parsed.text.trim(),
-          category: parsed.category || "General",
-          keyword: parsed.keyword || "shall",
-          verdict: "reextracted",
-          verified: true,
+          text:     parsed.text.trim(),
+          category: parsed.category || req.category || "General",
+          keyword:  parsed.keyword  || req.keyword  || "shall",
+          verdict:  "reextracted",
+          verified: false, // will be re-verified
+          unsure:   false,
         });
-        console.log(`[Re-extract] Fixed: "${parsed.text.substring(0, 70)}..."`);
+        console.log(`[Re-extract] Fixed: "${parsed.text.substring(0, 60)}..."`);
+      } else {
+        // Model couldn't find it — mark unsure
+        reextracted.push({
+          ...req,
+          verdict:  "unsure",
+          issue:    "Re-extraction found no obligation sentence in source context",
+          verified: false,
+          unsure:   true,
+        });
       }
     } catch (err) {
-      console.error(`[Re-extract] Failed for: "${req.text.substring(0, 50)}"`);
+      reextracted.push({
+        ...req,
+        verdict:  "unsure",
+        issue:    `Re-extraction error: ${err.message}`,
+        verified: false,
+        unsure:   true,
+      });
     }
 
     await sleep(2000);
   }
 
-  console.log(`[Re-extract] Recovered ${reextracted.length} of ${failed.length}`);
-  return { reextracted };
+  const toReverify   = reextracted.filter((r) => !r.unsure);
+  const newlyUnsure  = reextracted.filter((r) => r.unsure);
+
+  console.log(`[Re-extract] To re-verify: ${toReverify.length} | New unsure: ${newlyUnsure.length}`);
+
+  return {
+    pendingRequirements: toReverify,   // goes back to verify node
+    unsureRequirements:  newlyUnsure,  // accumulates in state
+    retryCount:          (state.retryCount || 0) + 1,
+  };
 }
 
 // ─────────────────────────────────────────────
 // NODE 4: Compile
-// Merges verified + reextracted, deduplicates, renumbers
+// confirmedRequirements already has everything accumulated
 // ─────────────────────────────────────────────
 function compileNode(state) {
   console.log("\n[Node: Compile] Building final requirements list");
 
-  const verified    = (state.verificationResults || []).filter((r) => r.verified);
-  const reextracted = state.reextracted || [];
-
   const VALID_CATEGORIES = ["Technical", "Legal", "Financial", "General"];
   const VALID_KEYWORDS   = ["shall", "must", "required", "mandatory"];
 
-  const combined = [...verified, ...reextracted].map((req) => ({
-    text:     req.text.trim(),
-    category: VALID_CATEGORIES.includes(req.category) ? req.category : "General",
-    keyword:  VALID_KEYWORDS.includes(req.keyword?.toLowerCase())
-                ? req.keyword.toLowerCase()
-                : "required",
-    verified: req.verified ?? true,
-  }));
+  // confirmedRequirements accumulated all verified items across every cycle
+  const confirmed = state.confirmedRequirements || [];
+  const unsure    = state.unsureRequirements    || [];
 
-  // Deduplicate by 80-char fingerprint
-  const seen   = new Set();
-  const unique = combined.filter((r) => {
+  // Deduplicate confirmed
+  const seenConfirmed = new Set();
+  const uniqueConfirmed = confirmed.filter((r) => {
     const fp = r.text.toLowerCase().replace(/\s+/g, " ").substring(0, 80);
-    if (seen.has(fp)) return false;
-    seen.add(fp);
+    if (seenConfirmed.has(fp)) return false;
+    seenConfirmed.add(fp);
     return true;
   });
 
-  // Assign sequential IDs after dedup
-  const final = unique.map((r, idx) => ({ ...r, id: idx + 1 }));
+  // Deduplicate unsure (also remove any that made it to confirmed)
+  const seenUnsure = new Set();
+  const uniqueUnsure = unsure.filter((r) => {
+    const fp = r.text.toLowerCase().replace(/\s+/g, " ").substring(0, 80);
+    // Skip if already confirmed
+    if (seenConfirmed.has(fp)) return false;
+    if (seenUnsure.has(fp)) return false;
+    seenUnsure.add(fp);
+    return true;
+  });
 
-  console.log(`[Compile] Final count: ${final.length} requirements`);
-  return { finalRequirements: final };
+  // Assign sequential IDs
+  const finalReqs = uniqueConfirmed.map((r, idx) => ({
+    id:       idx + 1,
+    text:     r.text.trim(),
+    category: VALID_CATEGORIES.includes(r.category) ? r.category : "General",
+    keyword:  VALID_KEYWORDS.includes(r.keyword?.toLowerCase()) ? r.keyword.toLowerCase() : "required",
+    verified: true,
+    unsure:   false,
+  }));
+
+  const finalUnsure = uniqueUnsure.map((r, idx) => ({
+    id:       `U${idx + 1}`,
+    text:     r.text.trim(),
+    category: VALID_CATEGORIES.includes(r.category) ? r.category : "General",
+    keyword:  VALID_KEYWORDS.includes(r.keyword?.toLowerCase()) ? r.keyword.toLowerCase() : "required",
+    verified: false,
+    unsure:   true,
+    issue:    r.issue || "Could not verify against source document",
+  }));
+
+  console.log(`[Compile] Verified: ${finalReqs.length} | Unsure: ${finalUnsure.length}`);
+
+  return {
+    finalRequirements:  finalReqs,
+    unsureRequirements: finalUnsure,
+  };
 }
 
 // ─────────────────────────────────────────────
-// ROUTER: Decide what to do after verification
+// ROUTER
 // ─────────────────────────────────────────────
 function shouldRetry(state) {
-  const failed     = state.failedRequirements || [];
+  const pending    = state.pendingRequirements || [];
   const retryCount = state.retryCount || 0;
   const maxRetries = state.maxRetries || 2;
 
-  if (failed.length === 0) {
-    console.log("[Router] No hallucinations → compile");
+  if (pending.length === 0) {
+    console.log("[Router] No pending requirements → compile");
     return "compile";
   }
 
   if (retryCount >= maxRetries) {
-    console.log(`[Router] Max retries (${maxRetries}) reached → compile with what we have`);
+    console.log(`[Router] Global max retries (${maxRetries}) reached → compile`);
     return "compile";
   }
 
-  console.log(`[Router] ${failed.length} hallucinations → re-extract (attempt ${retryCount + 1})`);
+  // Check if all remaining pending have hit per-requirement limit
+  const retryMap    = state.retryMap || {};
+  const MAX_PER_REQ = 3;
+  const stillRetryable = pending.filter((r) => {
+    const fp = fingerprint(r.text);
+    return (retryMap[fp] || 0) < MAX_PER_REQ;
+  });
+
+  if (stillRetryable.length === 0) {
+    console.log("[Router] All remaining failures hit per-requirement limit → compile");
+    return "compile";
+  }
+
+  console.log(`[Router] ${pending.length} pending → re-extract (attempt ${retryCount + 1})`);
   return "reextract";
 }
 
 // ─────────────────────────────────────────────
-// Build the LangGraph
+// Build Graph
 // ─────────────────────────────────────────────
 function buildGraph() {
   return new StateGraph(GraphState)
@@ -363,7 +494,7 @@ function buildGraph() {
       compile:   "compile",
     })
     .addEdge("reextract", "verify")
-    .addEdge("compile", END)
+    .addEdge("compile",   END)
     .compile();
 }
 
@@ -376,28 +507,33 @@ export async function extractWithVerification(rfpText, segments) {
 
   const graph  = buildGraph();
   const result = await graph.invoke({
-    sourceText: rfpText,
+    sourceText:            rfpText,
     segments,
-    retryCount: 0,
-    maxRetries: 2,
+    retryCount:            0,
+    maxRetries:            2,
+    retryMap:              {},
+    confirmedRequirements: [],
+    unsureRequirements:    [],
+    pendingRequirements:   [],
   });
 
-  const hallucinationCount = (result.verificationResults || [])
-    .filter((r) => !r.verified).length;
+  const verified    = result.finalRequirements?.length || 0;
+  const unsure      = result.unsureRequirements?.length || 0;
 
   console.log("\n=== PIPELINE COMPLETE ===");
-  console.log(`Extracted           : ${result.extracted?.length || 0}`);
-  console.log(`Hallucinations found: ${hallucinationCount}`);
-  console.log(`Recovered           : ${result.reextracted?.length || 0}`);
-  console.log(`Final clean count   : ${result.finalRequirements?.length || 0}`);
+  console.log(`Extracted  : ${result.extracted?.length || 0}`);
+  console.log(`Verified   : ${verified}`);
+  console.log(`Unsure     : ${unsure}`);
   console.log("=========================\n");
 
   return {
-    requirements: result.finalRequirements || [],
+    requirements:       result.finalRequirements || [],
+    unsureRequirements: result.unsureRequirements || [],
     stats: {
-      total:                  result.finalRequirements?.length || 0,
-      hallucinationsDetected: hallucinationCount,
-      recovered:              result.reextracted?.length || 0,
+      total:  verified,
+      unsure,
+      hallucinationsDetected: result.extracted?.length - verified - unsure || 0,
+      recovered: unsure > 0 ? 0 : 0,
     },
   };
 }

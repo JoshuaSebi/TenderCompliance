@@ -68,10 +68,12 @@ router.post("/extract", upload.single("rfp"), async (req, res) => {
       success: true,
       data: {
         requirements: result.requirements,
+        unsureRequirements: result.unsureRequirements || [],
         warning: result.warning || null,
         stats: result.stats
           ? {
               total: result.stats.total,
+              unsure: result.stats.unsure || 0,
               hallucinationsDetected: result.stats.hallucinationsDetected,
               recovered: result.stats.recovered,
               pageCount,
@@ -79,6 +81,7 @@ router.post("/extract", upload.single("rfp"), async (req, res) => {
             }
           : {
               total: result.requirements.length,
+              unsure: 0,
               pageCount,
               obligationKeywordsFound: obligationCount,
             },

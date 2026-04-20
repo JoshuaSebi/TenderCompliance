@@ -62,7 +62,7 @@ STATUS OPTIONS:
 - "Missing" → vendor does not address this requirement at all
 
 FIELDS TO RETURN FOR EACH:
-- requirementId: the ID number from the requirement (e.g. 1, 2, 3)
+- requirementId: the ID number from the requirement
 - requirement: copy the requirement text exactly as provided
 - status: "Met" | "Partial" | "Missing"
 - matchedPassage: copy the EXACT sentence or passage from the vendor proposal that addresses this requirement.
@@ -72,16 +72,17 @@ FIELDS TO RETURN FOR EACH:
     90–100 → very clear match or very clear absence
     60–89  → reasonable assessment but some ambiguity
     0–59   → uncertain due to vague language in proposal
-- category: copy the category from the requirement (Technical/Financial/Legal/General)
+- category: copy the category from the requirement
 
 ASSESSMENT RULES:
 - Base your assessment ONLY on the provided vendor proposal text
 - Do NOT assume or infer things the proposal does not explicitly state
-- Vague language ("we will endeavour to", "best effort", "where possible") → mark as "Partial" not "Met"
-- If the proposal is silent on a requirement → "Missing"
-- If the proposal explicitly contradicts a requirement → "Missing" with explanation in matchedPassage
+- Vague language ("best effort", "where possible", "endeavour to") → "Partial" not "Met"
+- Proposal is silent on requirement → "Missing"
+- Proposal explicitly contradicts requirement → "Missing"
+- IMPORTANT: You MUST return a result for EVERY requirement in the list — do not skip any
 
-Return ONLY raw JSON. No markdown. No fences. No explanation. Start { end }.
+Return ONLY raw JSON. No markdown. No fences. Start { end }.
 
 {
   "validationResults": [
@@ -98,9 +99,9 @@ Return ONLY raw JSON. No markdown. No fences. No explanation. Start { end }.
           },
           {
             role: "user",
-            content: `Validate the vendor proposal against each RFP requirement below.
+            content: `Validate the vendor proposal against EVERY requirement below. Return a result for each one.
 
-REQUIREMENTS:
+REQUIREMENTS (${requirements.length} total):
 ${reqText}
 
 VENDOR PROPOSAL:
@@ -110,22 +111,33 @@ ${proposalText.slice(0, 8000)}`,
       });
 
       const raw = chat.choices[0].message.content;
-      console.log(`[Validation] Batch ${batchIndex + 1} (first 150): ${raw.substring(0, 150)}`);
+      console.log(`[Validation] Batch ${batchIndex + 1} length: ${raw.length} | finish: ${chat.choices[0].finish_reason}`);
+
+      if (chat.choices[0].finish_reason === "length") {
+        console.warn(`[Validation] Batch ${batchIndex + 1} response truncated — reduce BATCH_SIZE`);
+      }
 
       const cleaned = cleanJsonResponse(raw);
-      const parsed = JSON.parse(cleaned);
+      const parsed  = JSON.parse(cleaned);
 
       if (!parsed.validationResults || !Array.isArray(parsed.validationResults)) return [];
 
-      return parsed.validationResults.filter((r) => r.requirementId !== undefined);
+      const results = parsed.validationResults.filter((r) => r.requirementId !== undefined);
+
+      // Warn if model skipped any requirements
+      if (results.length < requirements.length) {
+        console.warn(`[Validation] Batch ${batchIndex + 1}: expected ${requirements.length} results, got ${results.length}`);
+      }
+
+      return results;
 
     } catch (err) {
       if (err.status === 429 || err.message?.includes("429")) {
         const waitMatch = err.message?.match(/try again in ([\d.]+)s/);
         const waitMs = waitMatch
           ? Math.ceil(parseFloat(waitMatch[1]) * 1000) + 500
-          : attempt * 3000;
-        console.warn(`[Validation] Batch ${batchIndex + 1} rate limited. Waiting ${waitMs}ms...`);
+          : attempt * 5000;
+        console.warn(`[Validation] Batch ${batchIndex + 1} rate limited. Waiting ${waitMs}ms (retry ${attempt}/${retries})...`);
         await sleep(waitMs);
         continue;
       }
@@ -136,7 +148,19 @@ ${proposalText.slice(0, 8000)}`,
       }
 
       console.error(`[Validation] Batch ${batchIndex + 1} failed (attempt ${attempt}): ${err.message}`);
-      if (attempt === retries) return [];
+      if (attempt === retries) {
+        // On permanent failure, return Missing for all requirements in this batch
+        // so they don't silently disappear from the results
+        console.error(`[Validation] Batch ${batchIndex + 1} permanently failed — marking all as Missing`);
+        return requirements.map((r) => ({
+          requirementId:  r.id,
+          requirement:    r.text,
+          status:         "Missing",
+          matchedPassage: null,
+          confidenceScore: 0,
+          category:       r.category,
+        }));
+      }
       await sleep(1000 * attempt);
     }
   }
@@ -158,9 +182,9 @@ export async function validateRequirements(requirements, proposalText) {
 
     console.log(`\n[Validation] Validating ${requirements.length} requirements`);
 
-    // Batch requirements into groups of 10
-    // Sending all at once causes token limit errors on large requirement lists
-    const BATCH_SIZE = 10;
+    // Batch size of 5 keeps token usage low and avoids rate limits
+    // Each batch: ~5 requirements × ~100 tokens each + proposal = ~1500 tokens
+    const BATCH_SIZE = 5;
     const batches = [];
     for (let i = 0; i < requirements.length; i += BATCH_SIZE) {
       batches.push(requirements.slice(i, i + BATCH_SIZE));
@@ -168,9 +192,10 @@ export async function validateRequirements(requirements, proposalText) {
 
     console.log(`[Validation] ${requirements.length} requirements → ${batches.length} batch(es) of ${BATCH_SIZE}`);
 
-    // Process batches sequentially to respect rate limits
+    // Process batches sequentially with delay
     const allResults = [];
     for (let i = 0; i < batches.length; i++) {
+      console.log(`[Validation] Processing batch ${i + 1}/${batches.length}...`);
       const results = await validateBatch(batches[i], proposalText, i);
       allResults.push(...results);
 
@@ -180,20 +205,40 @@ export async function validateRequirements(requirements, proposalText) {
       }
     }
 
+    console.log(`[Validation] Total results collected: ${allResults.length} of ${requirements.length} expected`);
+
     // Normalize all results
     const normalized = allResults.map((r) => ({
-      requirementId:  r.requirementId,
-      requirement:    r.requirement?.trim() || "",
-      status:         ["Met", "Partial", "Missing"].includes(r.status) ? r.status : "Missing",
-      matchedPassage: r.matchedPassage?.trim() || null,
+      requirementId:   r.requirementId,
+      requirement:     r.requirement?.trim() || "",
+      status:          ["Met", "Partial", "Missing"].includes(r.status) ? r.status : "Missing",
+      matchedPassage:  r.matchedPassage?.trim() || null,
       confidenceScore: typeof r.confidenceScore === "number"
-                        ? Math.min(100, Math.max(0, r.confidenceScore))
-                        : 50,
-      category:       r.category?.trim() || "General",
+                         ? Math.min(100, Math.max(0, r.confidenceScore))
+                         : 50,
+      category:        r.category?.trim() || "General",
     }));
 
-    // Calculate overall compliance score
-    // Met = 1 point, Partial = 0.5 points, Missing = 0
+    // Fill in any requirements the model silently skipped
+    // This guarantees the frontend always shows all requirements
+    const returnedIds = new Set(normalized.map((r) => r.requirementId));
+    const skipped = requirements.filter((r) => !returnedIds.has(r.id));
+
+    if (skipped.length > 0) {
+      console.warn(`[Validation] ${skipped.length} requirements were silently skipped by model — marking as Missing`);
+      skipped.forEach((r) => {
+        normalized.push({
+          requirementId:   r.id,
+          requirement:     r.text,
+          status:          "Missing",
+          matchedPassage:  null,
+          confidenceScore: 0,
+          category:        r.category || "General",
+        });
+      });
+    }
+
+    // Calculate compliance score
     const total        = normalized.length;
     const metCount     = normalized.filter((r) => r.status === "Met").length;
     const partialCount = normalized.filter((r) => r.status === "Partial").length;
@@ -203,7 +248,7 @@ export async function validateRequirements(requirements, proposalText) {
       ? Math.round(((metCount + partialCount * 0.5) / total) * 100)
       : 0;
 
-    // Category breakdown — useful for frontend charts
+    // Category breakdown
     const byCategory = normalized.reduce((acc, r) => {
       const cat = r.category || "General";
       if (!acc[cat]) acc[cat] = { met: 0, partial: 0, missing: 0 };

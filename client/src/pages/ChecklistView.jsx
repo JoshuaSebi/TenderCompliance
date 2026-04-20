@@ -23,7 +23,7 @@ function exportToCSV(requirements) {
 
 export default function ChecklistView() {
   const navigate = useNavigate();
-  const { requirements, activeFilter, reset } = useComplianceStore();
+  const { requirements, unsureRequirements, activeFilter, reset } = useComplianceStore();
 
   const filtered =
     activeFilter === "All"
@@ -234,6 +234,80 @@ export default function ChecklistView() {
 
           {/* Requirements Table */}
           <RequirementsTable filtered={filtered} />
+
+          {/* Unsure Requirements Table */}
+          {unsureRequirements && unsureRequirements.length > 0 && (
+            <div
+              style={{
+                background: "rgba(255,255,255,0.02)",
+                border: "1px solid rgba(245,158,11,0.15)",
+                borderRadius: "16px",
+                overflow: "hidden",
+              }}
+            >
+              {/* Unsure Section Header */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  padding: "14px 24px",
+                  background: "rgba(245,158,11,0.03)",
+                  borderBottom: "1px solid rgba(245,158,11,0.1)",
+                }}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#f59e0b"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 8v4" />
+                  <path d="M12 16h.01" />
+                </svg>
+                <h3
+                  style={{
+                    fontSize: "14px",
+                    fontWeight: 700,
+                    color: "#f59e0b",
+                    margin: 0,
+                  }}
+                >
+                  Unsure Requirements — {unsureRequirements.length} item
+                  {unsureRequirements.length !== 1 ? "s" : ""} need review
+                </h3>
+              </div>
+
+              {/* Unsure description */}
+              <div
+                style={{
+                  padding: "10px 24px",
+                  borderBottom: "1px solid rgba(255,255,255,0.04)",
+                }}
+              >
+                <p
+                  style={{
+                    fontSize: "12px",
+                    lineHeight: "1.65",
+                    color: "#6b7280",
+                    margin: 0,
+                  }}
+                >
+                  These requirements were extracted but the AI could not fully
+                  verify them against the source document. Please review
+                  manually.
+                </p>
+              </div>
+
+              {/* Reuse RequirementsTable for unsure items */}
+              <RequirementsTable filtered={unsureRequirements} noWrapper />
+            </div>
+          )}
         </div>
       </div>
     </div>
