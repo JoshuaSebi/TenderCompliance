@@ -22,6 +22,7 @@ export default function UploadRFP() {
     setError(null);
     try {
       const data = await extractRequirements(rfpFile);
+      console.log("API response:", JSON.stringify(data, null, 2));
       setRequirements(data.requirements || []);
       setUnsureRequirements(data.unsureRequirements || []);
       setActiveFilter("All"); // ← reset filter so all requirements show

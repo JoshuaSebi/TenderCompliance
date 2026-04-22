@@ -24,7 +24,9 @@ function exportToCSV(requirements) {
 export default function ChecklistView() {
   const navigate = useNavigate();
   const { requirements, unsureRequirements, activeFilter, reset } = useComplianceStore();
-
+  console.log("Store requirements count:", requirements.length); // ← ADD THIS
+  console.log("Active filter:", activeFilter); // ← ADD THIS
+  
   const filtered =
     activeFilter === "All"
       ? requirements

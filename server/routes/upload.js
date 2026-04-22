@@ -59,7 +59,7 @@ router.post("/extract", upload.single("rfp"), async (req, res) => {
     console.log("=======================\n");
 
     // Step 3: Run extraction + verification pipeline
-    const result = await extractRequirements(rfpText, { pageCount });
+    const result = await extractRequirements(rfpText);
 
     console.log(`Final requirements: ${result.requirements.length}`);
 
