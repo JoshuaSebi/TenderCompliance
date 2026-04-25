@@ -15,7 +15,7 @@ export async function validateDocuments(rfpFile, vendorFile) {
   form.append("rfp", rfpFile);
   form.append("vendor", vendorFile);
 
-  const res = await fetch(`${BASE}/validate`, { method: "POST", body: form });
+  const res = await fetch(`${BASE}/validate-full`, { method: "POST", body: form });
   const json = await res.json();
   if (!json.success) throw new Error(json.error);
   return json.data;
